@@ -73,7 +73,7 @@ If Ghostel already works in your configuration, keep that setup. For Doom
 versions without the module, follow [Ghostel's installation
 instructions](https://github.com/dakra/ghostel#installation) to install the package
 and its native module. Ghostel is optional for splitting, resizing, rotation,
-and fresh empty buffers; it is required for the terminal commands.
+and opening scratch; it is required for the terminal commands.
 
 **4. Synchronize Doom, then restart Emacs:**
 
@@ -119,6 +119,10 @@ if dwindle still owns that setting. The current window arrangement remains usabl
 
 The bindings are active while `dwindle-mode` is enabled. Here `s` means **Super**,
 usually the Windows key on Linux; it is distinct from Emacs's Meta/Alt modifier.
+They work in Evil normal and insert states, including Ghostel. Dwindle's map
+takes precedence over Evil's state bindings, including Doom's macOS
+`+default/newline-below` on Super+Enter and `+default/newline-above` on
+Super+Shift+Enter. Disabling Dwindle restores those underlying bindings.
 
 | Operation | Left | Down | Up | Right |
 | --- | --- | --- | --- | --- |
@@ -132,14 +136,18 @@ It does not rotate the whole screen or merely cycle buffers.
 
 | Open in a new Dwindle split | Key | Command |
 | --- | --- | --- |
-| Fresh empty buffer | `s-E` (Super+Shift+e) | `dwindle-new-buffer` |
+| Shared `*scratch*` buffer | `s-e` (Super+e) | `dwindle-new-buffer` |
 | Fresh disposable Ghostel terminal | Super+Enter | `dwindle-new-terminal` |
 | Fresh persistent Ghostel terminal | Super+Shift+Enter | `dwindle-new-persistent-terminal` |
 
-All three select the new pane and inherit the focused buffer's
-`default-directory`: the current file's directory, Dired's directory, or a
-terminal's tracked working directory. Each terminal command creates a new shell
-session. It uses [Ghostel's public creation API](https://github.com/dakra/ghostel)
+All three select the new pane. `s-e` reuses `*scratch*`, preserving its contents,
+major mode, and directory. If that buffer has been killed, Dwindle recreates it
+using `initial-major-mode` and the focused buffer's directory.
+
+Each terminal command creates a new shell session and inherits the focused
+buffer's `default-directory`: the current file's directory, Dired's directory,
+or a terminal's tracked working directory. It uses
+[Ghostel's public creation API](https://github.com/dakra/ghostel)
 and places the terminal through Dwindle before starting the shell. Ghostel must
 be installed (Doom's `:term ghostel` module provides it); Dwindle loads it on demand.
 If splitting or terminal initialization fails, the layout is restored and the
@@ -202,6 +210,12 @@ divider, so panes sharing that subtree may resize together. Each step is 5% of
 the ancestor's size, rounded to columns or lines. Resizing does not push ratios
 further beyond the 10–90% limits, subject to Emacs's minimum sizes and fixed-size
 restrictions. Existing ratios outside that range are not normalized automatically.
+
+For finer movements when holding a resize key, set `dwindle-resize-step` to
+`0.02` (2%). Each command still makes one immediate adjustment, rounded to at
+least one column or line. Animated transitions are deliberately omitted:
+intermediate sizes trigger extra window hooks and Ghostel terminal resizes and
+redraws, which can slow down active shells. No animation timers are installed.
 
 At an outer edge, `ExpandTowards` follows XMonad's specific fallback: it **shrinks
 from the opposite edge**. For example, expanding right in the rightmost pane
@@ -297,6 +311,14 @@ raw reference to that pane across a later explicit tree transformation remains
 a limitation. Node focus has minibuffer feedback;
 there is no XMonad-style graphical border around the focused subtree.
 
+Transparent gaps with opaque pane backgrounds are not implemented. Stock macOS
+Emacs paints its dividers inside one frame; whole-frame `alpha` also fades the
+panes ([NS renderer](https://github.com/emacs-mirror/emacs/blob/master/src/nsterm.m)).
+Some builds offer selective fringe transparency, such as the
+[Emacs Plus transparency patch](https://github.com/d12frosted/homebrew-emacs-plus/blob/master/community/patches/frame-transparency/README.md),
+but this is not a complete transparent-divider solution and would require
+testing on that specific macOS build.
+
 ## Bounded window operations
 
 Emacs owns the window tree and the promotion of surviving children after a
@@ -340,12 +362,15 @@ If `make` is unavailable, run the test recipe directly:
 ```sh
 timeout -k 5s 60s emacs --batch -Q -L . -L test \
   -l test/dwindle-tests.el -l test/dwindle-tree-tests.el \
-  -l test/dwindle-terminal-tests.el \
+  -l test/dwindle-terminal-tests.el -l test/dwindle-evil-tests.el \
   -f ert-run-tests-batch-and-exit
 ```
 
 The tests run in disposable batch Emacs processes with an external timeout.
-`make check` also checks byte compilation. Evil/Doom command integration was
+The four Evil integration tests skip when Evil is absent from `load-path`; add
+`-L /path/to/evil` and paths for its dependencies to run them. They cover normal
+and insert key conflicts, mode toggling, scratch invocation, and delayed Evil
+loading. `make check` also checks byte compilation. Evil/Doom command integration was
 additionally smoke-tested in a disposable batch Emacs using the installed Evil
 package and Doom's actual split overrides: Ex file arguments, read-only splits, advice
 precedence, delayed Evil loading, key resolution, and disabling the mode.
@@ -353,8 +378,9 @@ This does not replace testing a full graphical Doom session with your own
 window-manager bindings and popup rules.
 
 The terminal commands were also checked against installed Ghostel and its native
-module, Evil, and evil-ghostel in a disposable Emacs process: separate shell
-processes started in the focused directory; disposable close terminated its
+module, Evil, and evil-ghostel in a disposable Emacs process: terminal shortcuts
+resolved in normal and insert states despite Doom's macOS newline bindings;
+separate shell processes started in the focused directory; disposable close terminated its
 process; persistent close retained it; declined `:q` left the session open; and
 an injected startup failure cleaned up the new process and restored the layout.
 

@@ -494,15 +494,46 @@ the fresh buffer, including its process via its normal cleanup hooks."
 
 ;;;###autoload
 (defun dwindle-new-buffer ()
-  "Open a fresh empty buffer in a Dwindle split and return its window.
-The new buffer inherits the focused buffer's `default-directory'."
+  "Open the shared `*scratch*' buffer in a new Dwindle split.
+Return the selected new window.  Preserve an existing scratch buffer's
+contents, major mode and directory.  If it does not exist, create it
+with `initial-major-mode' and the focused buffer's `default-directory'."
   (interactive)
-  (dwindle--open-fresh-buffer
-   (lambda (display)
-     (let ((buffer (let ((buffer-list-update-hook nil))
-                     (generate-new-buffer "untitled"))))
-       (funcall display buffer)
-       buffer))))
+  (when dwindle--inhibit
+    (user-error "A Dwindle window operation is already in progress"))
+  (if-let ((buffer (get-buffer "*scratch*")))
+      (let* ((source (selected-window))
+             (frame (window-frame source))
+             (focus (frame-parameter frame 'dwindle-focus))
+             (mark (frame-parameter frame 'dwindle-selected-node))
+             complete)
+        (unwind-protect
+            (dwindle--call-with-window-transaction
+             (lambda ()
+               (let* ((window (let ((dwindle--inhibit nil))
+                                (dwindle--split source buffer)))
+                      (expected (dwindle--pane-snapshot frame)))
+                 ;; Selection can invoke application callbacks.  Keep it
+                 ;; guarded and inside rollback, just like new creation.
+                 (select-window window)
+                 (unless (equal expected (dwindle--pane-snapshot frame))
+                   (error "An application changed the layout during scratch selection"))
+                 (setq complete t)
+                 window))
+             frame)
+          (unless complete
+            (set-frame-parameter frame 'dwindle-focus focus)
+            (set-frame-parameter frame 'dwindle-selected-node mark))))
+    (dwindle--open-fresh-buffer
+     (lambda (display)
+       (let ((buffer (let ((buffer-list-update-hook nil))
+                       (get-buffer-create "*scratch*"))))
+         ;; Register the new buffer for failure cleanup before mode hooks
+         ;; run.  The shared helper owns the whole initialization transaction.
+         (funcall display buffer)
+         (with-current-buffer buffer
+           (funcall initial-major-mode))
+         buffer)))))
 
 ;;;###autoload
 (defun dwindle-new-terminal (&optional persistent)
@@ -583,7 +614,7 @@ This hook only updates bookkeeping; it never changes the window tree."
 (defvar dwindle-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "s-r") #'dwindle-rotate)
-    (define-key map (kbd "s-E") #'dwindle-new-buffer)
+    (define-key map (kbd "s-e") #'dwindle-new-buffer)
     (define-key map (kbd "s-<return>") #'dwindle-new-terminal)
     (define-key map (kbd "s-RET") #'dwindle-new-terminal)
     (define-key map (kbd "s-S-<return>") #'dwindle-new-persistent-terminal)
