@@ -1,9 +1,8 @@
 ;;; config.el --- Example for your Doom config -*- lexical-binding: t; -*-
 
-;; Add these forms to ~/.doom.d/config.el (or ~/.config/doom/config.el).
-;; Adjust this path if you keep the checkout elsewhere.
-(add-to-list 'load-path (expand-file-name "~/emacs-dwindle"))
-(require 'dwindle)
+;; Add these forms to ~/.config/doom/config.el (or ~/.doom.d/config.el).
+;; Declare the GitHub package as shown in doom/packages.el, run doom sync,
+;; then restart Emacs.  No manual load-path entry is needed.
 
 ;; Optional: start with a horizontal divider instead of a vertical divider.
 ;; (setq dwindle-first-split 'below)
@@ -15,7 +14,10 @@
 ;; To restore the original trailing-pane dwindle chain:
 ;; (setq dwindle-split-policy 'tail)
 
-(dwindle-mode 1)
+(use-package! dwindle
+  :demand t
+  :config
+  (dwindle-mode 1))
 
 ;; The mode supplies Super+h/j/k/l to select windows,
 ;; Super+Shift+h/j/k/l to expand, and Super+Ctrl+h/j/k/l to shrink.

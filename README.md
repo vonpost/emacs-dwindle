@@ -27,8 +27,73 @@ original trailing-pane insertion if desired.
 
 ## Enable in Doom
 
-With this checkout at `~/emacs-dwindle`, add the following to your Doom
-`config.el` (`~/.doom.d/config.el` or `~/.config/doom/config.el`):
+Install from [vonpost/emacs-dwindle](https://github.com/vonpost/emacs-dwindle)
+using Doom's package manager. The files below belong in your existing Doom
+configuration directory, usually `~/.config/doom/` or `~/.doom.d/`.
+
+**1. Add the package to `packages.el`:**
+
+```elisp
+(package! dwindle
+  :recipe (:host github
+           :repo "vonpost/emacs-dwindle"
+           :files ("dwindle*.el")))
+```
+
+The recipe includes the main package and its resize, tree, Doom, and terminal
+helpers. Doom manages the checkout; you do not need to clone it yourself.
+
+**2. Enable it in `config.el`:**
+
+```elisp
+(use-package! dwindle
+  :demand t
+  :config
+  (dwindle-mode 1))
+```
+
+`:demand t` loads the package at startup so its global mode and Super bindings
+are active immediately. If you previously used the local-checkout instructions,
+remove that Dwindle `add-to-list 'load-path` form so it cannot shadow the installed
+package. Copyable examples are in [doom/packages.el](doom/packages.el) and
+[doom/config.el](doom/config.el).
+
+**3. For the terminal shortcuts, enable Ghostel:**
+
+If your Doom installation provides the Ghostel module, add or uncomment `ghostel`
+under `:term` inside your existing `(doom! ...)` form in `init.el`:
+
+```elisp
+;; Inside (doom! ...), alongside your existing terminal modules:
+:term
+ghostel
+```
+
+If Ghostel already works in your configuration, keep that setup. For Doom
+versions without the module, follow [Ghostel's installation
+instructions](https://github.com/dakra/ghostel#installation) to install the package
+and its native module. Ghostel is optional for splitting, resizing, rotation,
+and fresh empty buffers; it is required for the terminal commands.
+
+**4. Synchronize Doom, then restart Emacs:**
+
+```sh
+doom sync
+```
+
+If `doom` is not on your `PATH`, use the executable from your Doom installation,
+for example `~/.config/emacs/bin/doom sync` or `~/.emacs.d/bin/doom sync`.
+Restart the daemon too if you use `emacsclient`. This follows Doom's
+[package installation workflow](https://github.com/doomemacs/core/blob/master/docs/getting_started.org#installing-packages-from-external-sources).
+
+After restarting, `C-h v dwindle-mode` should show `t`. Try `C-x 2` to split,
+Super+Enter for a disposable terminal, or Super+Shift+Enter for a persistent one.
+The first terminal launch may ask you to install Ghostel's native module.
+
+### Local checkout alternative
+
+For development, use the following in `config.el` instead of the GitHub package
+declaration and `use-package!` configuration above. Adjust the path as needed:
 
 ```elisp
 (add-to-list 'load-path (expand-file-name "~/emacs-dwindle"))
@@ -36,9 +101,9 @@ With this checkout at `~/emacs-dwindle`, add the following to your Doom
 (dwindle-mode 1)
 ```
 
-Then evaluate those forms or restart Emacs. This local installation needs no
-`package!` declaration or `doom sync`. A commented example is in
-[doom/config.el](doom/config.el).
+Restart Emacs after switching installation methods. This direct local setup needs
+no Dwindle `package!` declaration; Ghostel still needs its own installation if you
+want terminal shortcuts.
 
 To try the package in a separate Emacs first, run this from the checkout:
 
