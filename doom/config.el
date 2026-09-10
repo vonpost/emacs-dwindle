@@ -15,6 +15,14 @@
 ;; To restore the original trailing-pane dwindle chain:
 ;; (setq dwindle-split-policy 'tail)
 
+;; All panes, including notebook output, side windows, dedicated panes and
+;; popups, participate by default.  Side/directional displays use BSP splits.
+;; To keep application-owned windows outside Dwindle and retain Doom popups:
+;; (setq dwindle-manage-windows 'ordinary)
+;; (setq dwindle-doom-manage-popups nil)
+;; To restore the old policy that only claims explicit Dwindle editor panes:
+;; (setq dwindle-manage-windows 'explicit)
+
 (use-package! dwindle
   :demand t
   :config

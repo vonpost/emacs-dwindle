@@ -22,6 +22,7 @@
 (require 'windmove)
 
 (declare-function ghostel-create "ghostel" (&optional name display identity))
+(declare-function dwindle-doom--release-popup "dwindle-doom" (buffer))
 (defvar dwindle-terminal-managed)
 (defvar dwindle-terminal-disposable)
 (defvar dwindle--terminal-close-permitted)
@@ -46,6 +47,28 @@ retains the original dwindle chain by splitting its trailing leaf."
   :type '(choice (const focused) (const tail))
   :group 'dwindle)
 
+(defcustom dwindle-manage-windows 'all
+  "Which windows participate in Dwindle's BSP operations.
+`all' includes side windows, dedicated panes, popups, atomic groups, and
+application windows.  Dwindle commands release their placement and window
+handlers before operating on them.  Native side and directional display
+actions use BSP splits.  Existing layouts are not rearranged on enrollment.
+
+`ordinary' manages existing ordinary windows, including special-mode
+buffers, native splits, and workspace restoration, while respecting
+application ownership, dedication, side windows, and atomic groups.
+
+`explicit' restores conservative ownership: only the initially selected
+editor pane and explicit Dwindle splits are enrolled, and special-mode
+buffers other than Dired are excluded.
+
+All policies exclude the minibuffer and respect `dwindle-ignore' on a
+window or its ancestor.  Explicit tree commands may recreate panes."
+  :type '(choice (const :tag "All windows" all)
+                 (const :tag "Ordinary windows" ordinary)
+                 (const :tag "Only explicit Dwindle panes" explicit))
+  :group 'dwindle)
+
 (defvar dwindle-mode)
 (defvar dwindle--inhibit nil
   "Non-nil while a dwindle split is in progress.
@@ -55,25 +78,46 @@ This prevents display hooks from recursively creating dwindle windows.")
 (defvar dwindle--previous-splitter nil
   "Default splitting function saved when enabling `dwindle-mode'.")
 (defvar dwindle--owned-windows (make-hash-table :test #'eq :weakness 'key)
-  "Private provenance of panes eligible for BSP reconstruction.
-Other packages do not need to add any window parameters.  Unknown panes
-are never inferred to be ours merely because they look like editor panes.")
+  "Private record of panes enrolled for BSP reconstruction.
+With `dwindle-manage-windows' set to `all', eligible panes are enrolled
+automatically.  The `explicit' policy requires known provenance.")
 (defvar dwindle--automatic-display nil
   "Non-nil while providing a leaf split to an external display action.
-Such an action owns the resulting pane; it is not enrolled for tree changes.")
+Internal node focus must not cause reconstruction during automatic display.")
+(defvar dwindle--defer-popup-cleanup nil
+  "Non-nil when an enclosing transaction will finish popup adoption.")
+(defvar dwindle--pending-popup-buffers nil
+  "Popup buffers whose lifecycle can be released after successful adoption.")
 
 (defun dwindle--navigation-record-p (record window)
   "Whether RECORD describes ordinary buffer navigation within WINDOW.
 Native `quit-restore' records also describe temporary window/frame/tab
 lifecycles.  Permit only a standard existing-buffer restoration record
-whose previously selected window is WINDOW itself.  Private provenance
-still protects unknown panes, regardless of their navigation records."
+whose previously selected window is WINDOW itself.  This is the subset
+accepted by the `explicit' policy and identifies self-references that
+must follow a pane when its view is copied during reconstruction."
   (pcase record
     (`(,(or 'same 'other) (,old-buffer ,start ,point ,size)
        ,previous-window ,buffer)
      (and (bufferp old-buffer) (number-or-marker-p start)
           (number-or-marker-p point) (numberp size)
           (eq previous-window window) (bufferp buffer)))))
+
+(defun dwindle--restorable-record-p (record)
+  "Whether RECORD is standard native `quit-restore' bookkeeping.
+Native window, frame, tab, and reuse records do not prevent management.
+Their close behavior is retained.  Conservative policies protect unknown
+formats."
+  (pcase record
+    (`(,(or 'same 'other) (,old-buffer ,start ,point ,size)
+       ,previous-window ,buffer)
+     (and (bufferp old-buffer) (number-or-marker-p start)
+          (number-or-marker-p point) (numberp size)
+          (windowp previous-window) (bufferp buffer)))
+    (`(,kind ,type ,previous-window ,buffer)
+     (and (memq type '(window frame tab))
+          (or (eq kind 'same) (eq kind type))
+          (windowp previous-window) (bufferp buffer)))))
 
 (defun dwindle--foreign-window-p (window)
   "Return non-nil when valid WINDOW carries application ownership markers.
@@ -84,50 +128,83 @@ requirement for packages."
       (window-parameter window 'window-side)
       (window-parameter window 'popup)
       (let ((record (window-parameter window 'quit-restore)))
-        (and record (not (dwindle--navigation-record-p record window))))
+        (and record
+             (not (and (window-live-p window)
+                       (if (memq dwindle-manage-windows '(all ordinary))
+                           (dwindle--restorable-record-p record)
+                         (dwindle--navigation-record-p record window))))))
       (window-parameter window 'no-other-window)
       (window-parameter window 'no-delete-other-windows)
       (cl-some (lambda (parameter)
                  (functionp (window-parameter window parameter)))
                '(split-window delete-window delete-other-windows))))
 
+(defun dwindle--explicitly-ignored-window-p (window)
+  "Whether valid WINDOW or an ancestor explicitly opts out of Dwindle."
+  (let ((node window) ignored)
+    (while (and node (not ignored))
+      (setq ignored (window-parameter node 'dwindle-ignore)
+            node (window-parent node)))
+    ignored))
+
+(defun dwindle--ignored-window-p (window)
+  "Whether WINDOW is excluded, including a group containing an ignored pane.
+Native atomic and side-window groups share restrictions.  Keep such a
+group intact if any of its leaves explicitly opts out."
+  (or (dwindle--explicitly-ignored-window-p window)
+      (let ((group (window-atom-root window))
+            (node window))
+        (while node
+          (when (memq (window-parameter node 'window-side)
+                      '(left right top bottom))
+            (setq group node))
+          (setq node (window-parent node)))
+        (and group
+             (cl-some #'dwindle--explicitly-ignored-window-p
+                      (dwindle--subtree-windows group))))))
+
 (defun dwindle--managed-window-p (window)
-  "Return non-nil if WINDOW is an ordinary, independently managed leaf.
-Side windows, Doom popups, dedicated windows, atomic windows, and
-windows with application-specific splitting behavior are excluded."
+  "Return non-nil if live WINDOW participates in the current policy.
+This predicate only observes windows; commands release application
+restrictions with `dwindle--prepare-frame' before changing the layout."
   (and (window-live-p window)
        (not (window-minibuffer-p window))
-       (not (window-dedicated-p window))
-       (not (window-atom-root window))
-       (let ((node window) foreign)
-         (while (and node (not foreign))
-           (setq foreign (dwindle--foreign-window-p node)
-                 node (window-parent node)))
-         (not foreign))))
+       (not (dwindle--ignored-window-p window))
+       (or (eq dwindle-manage-windows 'all)
+           (and (not (window-dedicated-p window))
+                (not (window-atom-root window))
+                (let ((node window) foreign)
+                  (while (and node (not foreign))
+                    (setq foreign (dwindle--foreign-window-p node)
+                          node (window-parent node)))
+                  (not foreign))))))
 
 (defun dwindle--reconstruction-eligible-p (window)
   "Whether ordinary WINDOW is suitable for a structural BSP operation.
-Special application buffers are protected automatically.  Dired is an
-ordinary navigation buffer for this purpose; native ownership parameters
-still take precedence."
+The `explicit' policy excludes special-mode buffers other than Dired.
+The other policies include special-mode buffers."
   (and (dwindle--managed-window-p window)
-       (with-current-buffer (window-buffer window)
-         (or (not (derived-mode-p 'special-mode))
-             (derived-mode-p 'dired-mode)))))
+       (or (memq dwindle-manage-windows '(all ordinary))
+           (with-current-buffer (window-buffer window)
+             (or (not (derived-mode-p 'special-mode))
+                 (derived-mode-p 'dired-mode))))))
 
 (defun dwindle--owned-window-p (window)
-  "Whether WINDOW is a known BSP pane still eligible for reconstruction."
+  "Whether WINDOW participates in BSP reconstruction.
+Check eligibility on demand so a newly opened or restored pane is usable
+even before the next window configuration hook."
   (and (window-live-p window)
-       (gethash window dwindle--owned-windows)
        (if (dwindle--reconstruction-eligible-p window)
-           t
+           (or (gethash window dwindle--owned-windows)
+               (and (bound-and-true-p dwindle-mode)
+                    (memq dwindle-manage-windows '(all ordinary))
+                    (not dwindle--inhibit)
+                    (puthash window t dwindle--owned-windows)))
          (remhash window dwindle--owned-windows)
          nil)))
 
 (defun dwindle--claim-window (window)
-  "Internally enroll eligible WINDOW and return it, or return nil.
-Only explicit Dwindle operations may claim windows.  Display actions and
-ordinary native/package-created panes are not automatically enrolled."
+  "Internally enroll eligible WINDOW and return it, or return nil."
   (when (dwindle--reconstruction-eligible-p window)
     (puthash window t dwindle--owned-windows)
     window))
@@ -137,8 +214,7 @@ ordinary native/package-created panes are not automatically enrolled."
   (remhash window dwindle--owned-windows))
 
 (defun dwindle--initialize-frame (frame)
-  "Enroll only FRAME's initially selected editor pane, then observe it.
-Other preexisting panes remain protected without package cooperation."
+  "Enroll FRAME's windows according to `dwindle-manage-windows'."
   (when (frame-live-p frame)
     (dwindle--claim-window (frame-selected-window frame))
     (dwindle--refresh frame)))
@@ -158,20 +234,23 @@ to windows.  It is safe to run from a window configuration hook.
 References are snapshots only: commands revalidate them on every use."
   (let ((frame (or frame (selected-frame))))
     (when (frame-live-p frame)
-      ;; Observe known live panes only.  Saved configurations may later
-      ;; revive known objects; unknown replacements are never adopted here.
+      ;; Enrollment changes only private bookkeeping.  During an operation,
+      ;; callbacks must not enroll intermediate reconstruction windows.
       (dolist (window (window-list frame 'no-minibuffer))
-        (when (gethash window dwindle--owned-windows)
-          (dwindle--owned-window-p window)))
+        (dwindle--owned-window-p window))
       (let ((windows (dwindle--windows frame)))
         (set-frame-parameter frame 'dwindle-root
-                             (and windows (window-main-window frame)))
+                             (and windows
+                                  (if (eq dwindle-manage-windows 'all)
+                                      (frame-root-window frame)
+                                    (window-main-window frame))))
         (set-frame-parameter frame 'dwindle-master (car windows))
         (set-frame-parameter frame 'dwindle-tail (car (last windows)))))))
 
 (defun dwindle-root-window (&optional frame)
-  "Return FRAME's current native main root, or nil without managed leaves.
-The root may be an internal window.  Native side windows are outside it.
+  "Return FRAME's current native root, or nil without managed leaves.
+The root may be an internal window.  Under conservative policies, native
+side windows are outside the managed main root.
 Always refresh first, including after Winner or workspace restoration."
   (let ((frame (or frame (selected-frame))))
     (dwindle--refresh frame)
@@ -201,6 +280,52 @@ Deleting the master promotes the first surviving leaf in native order."
       (setq nodes (nconc nodes (dwindle--all-nodes child))
             child (window-next-sibling child)))
     nodes))
+
+(defun dwindle--prepare-frame (&optional frame)
+  "Release application window restrictions in FRAME for the `all' policy.
+Keep window identities, buffers, geometry, and display state.  Only explicit
+operations and display actions call this; observation hooks never do.
+The minibuffer and explicitly ignored windows retain their restrictions."
+  (when (and (eq dwindle-manage-windows 'all) (not dwindle--inhibit))
+    (let ((frame (or frame (selected-frame)))
+          (dwindle--inhibit t)
+          popups)
+      (dolist (node (dwindle--all-nodes (frame-root-window frame)))
+        (unless (dwindle--ignored-window-p node)
+          (when (window-live-p node)
+            (when (window-parameter node 'popup)
+              (cl-pushnew (window-buffer node) popups)
+              ;; Doom's disable hook only restores modelines on windows
+              ;; still marked as popups.  Do this in the window transaction
+              ;; before clearing the marker and deferring buffer cleanup.
+              (when (with-current-buffer (window-buffer node)
+                      (bound-and-true-p +popup-buffer-mode))
+                (set-window-parameter node 'mode-line-format nil)))
+            (set-window-dedicated-p node nil))
+          (dolist (parameter '(window-side window-slot window-vslot window-atom
+                              popup no-other-window no-delete-other-windows
+                              split-window delete-window delete-other-windows
+                              window-preserved-size))
+            (when (window-parameter node parameter)
+              (set-window-parameter node parameter nil)))))
+      (dolist (buffer popups)
+        (if dwindle--defer-popup-cleanup
+            (cl-pushnew buffer dwindle--pending-popup-buffers)
+          (let ((dwindle--pending-popup-buffers (list buffer)))
+            (dwindle--finish-preparation))))
+      (dwindle--refresh frame))))
+
+(defun dwindle--finish-preparation ()
+  "Release adopted popup buffer lifecycles after a successful operation.
+Keep the lifecycle while another window still displays the same buffer
+as a popup, including an explicitly ignored window on another frame."
+  (dolist (buffer dwindle--pending-popup-buffers)
+    (when (and (buffer-live-p buffer)
+               (not (cl-some (lambda (window)
+                               (window-parameter window 'popup))
+                             (get-buffer-window-list buffer nil t))))
+      (dwindle-doom--release-popup buffer)))
+  (setq dwindle--pending-popup-buffers nil))
 
 (defun dwindle--without-buffer-list-hooks (function)
   "Call FUNCTION without global or buffer-local buffer-list callbacks.
@@ -301,6 +426,7 @@ The split is a single native operation.  If a native split or buffer
 initialization hook fails, restore the original layout and views."
   (when dwindle--inhibit
     (user-error "A dwindle split is already in progress"))
+  (dwindle--prepare-frame (window-frame source))
   (unless (dwindle--managed-window-p source)
     (user-error "This window is managed by another application"))
   (unless (memq dwindle-first-split '(right below))
@@ -435,6 +561,7 @@ Failed initialization restores the original layout and cleans up only
 the fresh buffer, including its process via its normal cleanup hooks."
   (when dwindle--inhibit
     (user-error "A Dwindle window operation is already in progress"))
+  (dwindle--prepare-frame)
   (unless (dwindle--managed-window-p (selected-window))
     (user-error "This window is managed by another application"))
   (let* ((source (selected-window))
@@ -574,6 +701,7 @@ The last ordinary window cannot be deleted with this command."
   (interactive)
   (when dwindle--inhibit
     (user-error "A dwindle window operation is already in progress"))
+  (dwindle--prepare-frame)
   (unless (dwindle--managed-window-p (selected-window))
     (user-error "This window is managed by another application"))
   (when (length= (dwindle--windows) 1)
@@ -604,6 +732,7 @@ fallback; never retry splitting recursively."
 (require 'dwindle-doom)
 (require 'dwindle-tree)
 (require 'dwindle-terminal)
+(require 'dwindle-display)
 
 (defun dwindle--observe-selection (frame)
   "Discard FRAME's node focus if another leaf was selected.
@@ -639,10 +768,10 @@ This hook only updates bookkeeping; it never changes the window tree."
 ;;;###autoload
 (define-minor-mode dwindle-mode
   "Use native dwindle window splits and directional Super bindings.
-Existing layouts are observed without rebuilding windows.  Only the
-selected eligible pane is initially enrolled for structural operations.
-Automatic display splits remain owned by their caller.  Ordinary
-interactive splits divide the focused leaf and enroll the new pane.
+Existing layouts are observed without rebuilding windows.  All non-minibuffer
+panes participate by default, including automatic display and workspace
+restoration; see `dwindle-manage-windows' for conservative ownership.
+Interactive splits divide the focused leaf and enroll the new pane.
 Explicit low-level `split-window' calls retain their semantics.
 Disabling the mode removes the integration and leaves windows in place."
   :global t
@@ -659,6 +788,7 @@ Disabling the mode removes the integration and leaves windows in place."
         (add-hook 'window-selection-change-functions #'dwindle--observe-selection)
         (dwindle-doom-enable)
         (dwindle-terminal-enable)
+        (dwindle-display-enable)
         (mapc #'dwindle--initialize-frame (frame-list)))
     (when dwindle--installed
       (when (eq (default-value 'split-window-preferred-function)
@@ -669,6 +799,7 @@ Disabling the mode removes the integration and leaves windows in place."
       (remove-hook 'window-selection-change-functions #'dwindle--observe-selection)
       (dwindle-doom-disable)
       (dwindle-terminal-disable)
+      (dwindle-display-disable)
       (dolist (frame (frame-list))
         (dolist (parameter '(dwindle-root dwindle-master dwindle-tail
 					  dwindle-focus dwindle-selected-node))

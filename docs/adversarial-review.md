@@ -1,5 +1,11 @@
 # Adversarial compatibility review
 
+This is a historical review. The later broad-management change makes automatic
+enrollment the default; the private provenance policy described below remains
+available as `(setq dwindle-manage-windows 'explicit)`. Standard ordinary
+`quit-restore` records are now preserved and remapped during reconstruction.
+See the README for the current ownership and Doom popup behavior.
+
 Reviewed on 2026-09-09 by Astra, using extra-high reasoning, in an independent
 review agent. Runtime probes used GNU Emacs 30.2 in disposable processes. Every
 Emacs invocation had an external timeout; the user's running Emacs was untouched.

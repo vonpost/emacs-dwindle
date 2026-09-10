@@ -245,30 +245,64 @@ it does not rotate an existing tree.
 
 ## Doom, popups, and existing layouts
 
-The mode reads the current layout and splits the focused ordinary leaf. It
+The mode reads the current layout and splits the focused leaf. It
 does not rearrange an existing layout when enabled or from a window hook.
 Manual combinations containing three or more siblings remain usable: directional
 resizing moves only the adjacent pair, preserving the other siblings. Explicit
 tree transformations can turn an entirely Dwindle-owned combination into a binary tree.
 
-Doom popups, native side windows, dedicated windows, atomic window groups, and
-windows with application-specific split/deletion behavior are excluded. The
-Temporary-window `quit-restore` records, `no-other-window`, and
-`no-delete-other-windows` parameters are also respected,
-including ownership markers on an internal ancestor. Their own display and close
-rules remain in control. Resizing never moves a foreign divider; unrelated
-foreign siblings do not block a valid pair of ordinary panes. A tree command
-only transforms an entirely Dwindle-owned subtree and cannot move a node across
-an unowned branch.
+Dwindle manages **all windows by default**, including side panels, dedicated
+windows, popups, atomic groups, Help and compilation buffers, terminals, and
+panes restored with a workspace or Winner. The minibuffer is excluded. A window
+becomes eligible immediately; there is no need to split it with a Dwindle command
+first. Setting `dwindle-ignore` on a window or an ancestor explicitly excludes it.
 
-Dwindle keeps a private record of the panes it owns for structural operations.
-Enabling the mode enrolls only the selected eligible editor pane in each frame.
-An explicit Dwindle split enrolls the invoking pane and its new pane. Preexisting
-siblings and panes created by native commands or other packages remain outside
-that record, even when they have no identifying parameters. Other packages need
-no changes or Dwindle-specific flags. Special-mode application buffers are also
-protected from reconstruction; Dired remains eligible as an editor navigation
-buffer.
+Before a Dwindle command operates, it releases application placement restrictions,
+dedication, atomic grouping, and custom split/deletion handlers. This keeps the
+existing window objects, buffers, scrolling, and geometry. A subsequent explicit
+tree transformation may recreate windows as usual. Observation hooks only update
+bookkeeping; enabling the mode does not rearrange the screen.
+
+Native side-window and directional display actions also use focused BSP splits.
+This includes `emacs-jupyter-notebook` output: its directional display action
+otherwise bypasses Emacs's preferred splitter. Output panels left over from its
+older side-window implementation are usable too; the next Dwindle command
+releases their old restrictions. Reopening a visible output panel reuses it and
+preserves manual resizing.
+
+In Doom, the standard stacked-side popup display action opens ordinary Dwindle
+panes by default. This brings common popup buffers into the layout before Doom
+assigns side-window ownership. Existing popups are adopted when a Dwindle command
+runs, including removal of Doom's transient popup buffer lifecycle.
+
+Opening a popup from an ignored sidebar uses an eligible pane. If a split will
+not fit, Dwindle reuses an eligible ordinary pane when the display rule permits
+it. Doom's Eshell and Vterm toggles also keep their newly routed panes managed.
+Requests with no usable pane retain the application's display fallback.
+
+To retain application window ownership while managing every ordinary pane, use:
+
+```elisp
+(setq dwindle-manage-windows 'ordinary)
+```
+
+This preserves the former `all` behavior: side windows, existing popups,
+dedicated panes, atomic groups, custom window handlers, `no-other-window`, and
+`no-delete-other-windows` remain boundaries. Doom's standard popups still route
+through BSP; also set `dwindle-doom-manage-popups` to `nil` to retain their native
+placement and lifecycle. Under `all`, native side display routing and command
+adoption apply independently of that Doom-specific option.
+
+For the previous conservative ownership behavior, set:
+
+```elisp
+(setq dwindle-manage-windows 'explicit)
+```
+
+Under that policy, enabling the mode enrolls only the selected eligible editor
+pane in each frame. Explicit Dwindle splits enroll the invoking and new panes;
+other windows and special-mode buffers other than Dired stay outside structural
+operations. This policy also retains Doom's popup behavior.
 
 Rotate and other tree commands stop at an unowned branch. They still work within
 an owned subtree beside it, preserving the outside pane's window object, buffer,
@@ -276,14 +310,18 @@ view, and geometry. Closing that outside pane lets native Emacs collapse the
 tree; Dwindle checks the resulting boundaries on the next command.
 
 The default `display-buffer` splitter uses dwindle when Emacs asks it to create
-a new ordinary window. The resulting pane belongs to the caller and is never
-automatically enrolled for reconstruction. This path always performs a leaf
+a new ordinary window. The resulting pane participates in Dwindle by default.
+This path always performs a leaf
 split, even when an internal BSP node is focused. Existing `display-buffer-alist`
 rules can choose another action, and Emacs may reuse an existing window. Switching
 a buffer or opening a file in the current window does not itself create a pane.
-Native restoration records for ordinary navigation within the selected pane
-remain eligible. Records for temporary windows, frames, tabs, or background
-reuse of another pane protect that pane. These cases follow Emacs's
+Native restoration records for new windows, frames, tabs, and background reuse
+remain eligible.
+Tree transformations update their window references so `quit-window` can still
+close the temporary pane or restore its previous buffer and selection. Native
+frame/tab close behavior is retained. Unknown record formats remain protected
+under the `ordinary` and `explicit` policies.
+These cases follow Emacs's
 [quit-restore record format](https://www.gnu.org/software/emacs/manual/html_node/elisp/Quitting-Windows.html).
 
 Evil integration wraps its two split commands outside Doom's overrides, retaining
@@ -295,20 +333,20 @@ other packages to create layouts that have their own requirements.
 Workspace restoration and Winner undo can replace the native window tree.
 Dwindle reads the current tree before operating, so it does not depend on window
 objects from a previous workspace. Previously owned objects revived by a saved
-configuration retain their eligibility; unknown replacement windows are not
-automatically enrolled. `(dwindle-root-window)` returns the current
-main root, which may be an internal window; `(dwindle-master-window)` returns
-the first ordinary live leaf. Both accept an optional frame.
+configuration retain their eligibility; replacement ordinary windows are
+automatically enrolled under the default policy. `(dwindle-root-window)` returns the current
+frame root (the main root under conservative policies), which may be an internal
+window; `(dwindle-master-window)` returns the first managed live leaf. Both accept
+an optional frame.
 
 Explicit tree transformations recreate native window objects inside their
 owned region, while retaining buffers, points, scrolling, history, and window
 presentation. All outside windows must keep their identities and geometry.
 Emacs has no public API to rotate a split while preserving every window object.
-Private ownership protects panes created outside Dwindle automatically. A package
-that silently takes over an already owned pane without any standard ownership
-indicators cannot be distinguished from ordinary buffer navigation; retaining a
-raw reference to that pane across a later explicit tree transformation remains
-a limitation. Node focus has minibuffer feedback;
+Packages retaining raw references to ordinary panes can lose those references
+after an explicit tree transformation. Use the `explicit` policy for conservative
+ownership, or set a pane's `dwindle-ignore` parameter to exclude it. Node focus
+has minibuffer feedback;
 there is no XMonad-style graphical border around the focused subtree.
 
 Transparent gaps with opaque pane backgrounds are not implemented. Stock macOS
@@ -346,6 +384,9 @@ still apply; there is no automatic overflow stack when a split does not fit.
 
 The [Astra adversarial review](docs/adversarial-review.md) records the callback
 failures found and repaired, interference tests, and remaining limits.
+The later [window-management review](docs/window-management-review.md) covers
+automatic enrollment, common Doom displays, and native quit behavior across
+tabs and frames.
 
 ## Validation
 
@@ -362,6 +403,7 @@ If `make` is unavailable, run the test recipe directly:
 ```sh
 timeout -k 5s 60s emacs --batch -Q -L . -L test \
   -l test/dwindle-tests.el -l test/dwindle-tree-tests.el \
+  -l test/dwindle-ownership-tree-tests.el -l test/dwindle-doom-tests.el \
   -l test/dwindle-terminal-tests.el -l test/dwindle-evil-tests.el \
   -f ert-run-tests-batch-and-exit
 ```
@@ -370,7 +412,11 @@ The tests run in disposable batch Emacs processes with an external timeout.
 The four Evil integration tests skip when Evil is absent from `load-path`; add
 `-L /path/to/evil` and paths for its dependencies to run them. They cover normal
 and insert key conflicts, mode toggling, scratch invocation, and delayed Evil
-loading. `make check` also checks byte compilation. Evil/Doom command integration was
+loading. The optional real Doom popup test uses the installed `ui/popup` module;
+set `DWINDLE_DOOM_POPUP_DIR` to its directory if it is not found automatically.
+It runs in a disposable Emacs process, including delayed loading and normal
+popup behavior after disabling Dwindle. `make check` also checks byte compilation.
+Evil/Doom command integration was
 additionally smoke-tested in a disposable batch Emacs using the installed Evil
 package and Doom's actual split overrides: Ex file arguments, read-only splits, advice
 precedence, delayed Evil loading, key resolution, and disabling the mode.
@@ -385,6 +431,7 @@ process; persistent close retained it; declined `:q` left the session open; and
 an injected startup failure cleaned up the new process and restored the layout.
 
 `make smoke` runs a separate terminal Emacs through 100 split/delete/resize
-operations and 10 rotations, including real redisplay hooks, under an external timeout. It needs
-the `script` command from util-linux. Without `make`, run
+operations and 10 rotations, including real redisplay hooks, and checks native
+quit focus across two frames after rotation. It runs under an external timeout
+and needs the `script` command from util-linux. Without `make`, run
 `sh test/run-redisplay-smoke.sh`.

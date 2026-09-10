@@ -17,6 +17,8 @@
 (require 'window)
 
 (declare-function dwindle--managed-window-p "dwindle" (window))
+(declare-function dwindle--prepare-frame "dwindle" (&optional frame))
+(defvar dwindle-manage-windows)
 (declare-function dwindle--focused-node "dwindle-tree" (&optional window))
 (declare-function dwindle--call-with-window-transaction "dwindle"
                   (function &optional frame))
@@ -31,9 +33,10 @@ subject to Emacs window minimum sizes and fixed-size restrictions."
 
 (defun dwindle--resize-managed-subtree-p (window)
   "Return non-nil if WINDOW contains only eligible managed windows.
-Atomic windows are excluded even if their individual leaves are managed."
+Atomic groups participate under the `all' policy."
   (and (window-valid-p window)
-       (not (window-atom-root window))
+       (or (eq dwindle-manage-windows 'all)
+           (not (window-atom-root window)))
        (if (window-live-p window)
            (dwindle--managed-window-p window)
          (let ((child (window-child window))
@@ -79,6 +82,7 @@ nothing.  Return the signed applied change in columns or lines, or nil
 when no boundary can move.  Never borrow space outside the chosen split."
   (when (bound-and-true-p dwindle--inhibit)
     (user-error "A dwindle window operation is already in progress"))
+  (dwindle--prepare-frame (and window (window-frame window)))
   (setq window (or window (dwindle--focused-node))
         count (or count 1))
   (unless (memq direction '(left right up down))
@@ -139,6 +143,7 @@ when no boundary can move.  Never borrow space outside the chosen split."
   "Move a BSP divider in DIRECTION by COUNT steps.
 As in XMonad, prefer the first enclosing divider after the focused node
 on this axis; if none exists, use the closest enclosing divider before it."
+  (dwindle--prepare-frame)
   (let* ((window (dwindle--focused-node))
          (horizontal (memq direction '(left right)))
          (forward (if horizontal 'right 'down))

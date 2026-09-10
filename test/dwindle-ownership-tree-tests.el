@@ -1,0 +1,190 @@
+;;; dwindle-ownership-tree-tests.el --- Native display lifecycle tests -*- lexical-binding: t; -*-
+
+(require 'dwindle-tests)
+(require 'dwindle-tree-tests)
+
+(ert-deftest dwindle-tree-internal-restoration-record-remains-a-boundary ()
+  (dwindle-test--with-layout
+    (let* ((source (selected-window))
+           (target (split-window source nil 'right))
+           (parent (window-parent target))
+           (record (list 'window 'window source (window-buffer source))))
+      ;; Native restoration belongs to leaves.  A record on a combination
+      ;; is application state that reconstruction cannot safely migrate.
+      (set-window-parameter parent 'quit-restore record)
+      (let ((before (dwindle-test--snapshot)))
+        (select-window target)
+        (should-error (dwindle-rotate) :type 'user-error)
+        (should (equal before (dwindle-test--snapshot)))
+        (should (eq (window-parameter parent 'quit-restore) record))
+        (should (window-live-p source))
+        (should (window-live-p target))))))
+
+(ert-deftest dwindle-tree-displayed-help-quits-after-rotation ()
+  (dwindle-test--with-layout
+    (let* ((source-buffer (generate-new-buffer " *dwindle-return-source*"))
+           (help (generate-new-buffer " *dwindle-rotated-help*"))
+           (source (dwindle-split source-buffer)))
+      (unwind-protect
+          (progn
+            (with-current-buffer help (help-mode))
+            (let* ((popup (display-buffer-pop-up-window help nil))
+                   (record (window-parameter popup 'quit-restore)))
+              (should (eq (nth 2 record) source))
+              (should (dwindle--owned-window-p popup))
+              (select-window popup)
+              (dwindle-focus-parent)
+              (dwindle-rotate)
+              (let ((new-source (get-buffer-window source-buffer))
+                    (new-popup (get-buffer-window help)))
+                (should-not (window-live-p source))
+                (should-not (window-live-p popup))
+                (should (eq (nth 2 record) source))
+                (should (eq (nth 2 (window-parameter new-popup 'quit-restore))
+                            new-source))
+                (quit-window nil new-popup)
+                (should-not (window-live-p new-popup))
+                (should (eq (selected-window) new-source))
+                (should (buffer-live-p help)))))
+        (kill-buffer source-buffer)
+        (kill-buffer help)))))
+
+(ert-deftest dwindle-tree-background-reuse-restores-buffer-and-focus ()
+  (dwindle-test--with-layout
+    (let* ((target (selected-window))
+           (old-buffer (window-buffer target))
+           (source-buffer (generate-new-buffer " *dwindle-background-source*"))
+           (displayed (generate-new-buffer " *dwindle-background-target*"))
+           (source (dwindle-split source-buffer)))
+      (unwind-protect
+          (progn
+            (window--display-buffer displayed target 'reuse)
+            (let ((record (window-parameter target 'quit-restore)))
+              (dwindle-rotate)
+              (let ((new-source (get-buffer-window source-buffer))
+                    (new-target (get-buffer-window displayed)))
+                (should-not (window-live-p source))
+                (should (eq (nth 2 record) source))
+                (should (eq (nth 2 (window-parameter new-target 'quit-restore))
+                            new-source))
+                (quit-window nil new-target)
+                (should (eq (window-buffer new-target) old-buffer))
+                (should (eq (selected-window) new-source))
+                (should-not (window-parameter new-target 'quit-restore)))))
+        (kill-buffer source-buffer)
+        (kill-buffer displayed)))))
+
+(ert-deftest dwindle-tree-outside-side-window-keeps-native-return-target ()
+  (dwindle-test--with-layout
+    (let* ((source-buffer (generate-new-buffer " *dwindle-side-source*"))
+           (displayed (generate-new-buffer " *dwindle-side-display*"))
+           (source (dwindle-split source-buffer)))
+      (unwind-protect
+          (let* ((side (display-buffer-in-side-window displayed '((side . bottom))))
+                 (record (window-parameter side 'quit-restore))
+                 (edges (window-edges side)))
+            (should (eq (nth 2 record) source))
+            (select-window source)
+            (dwindle-rotate)
+            (let ((new-source (get-buffer-window source-buffer)))
+              (should-not (window-live-p source))
+              (should (window-live-p side))
+              (should (equal (window-edges side) edges))
+              (should (eq (window-buffer side) displayed))
+              (should (eq (nth 2 record) source))
+              (should (eq (nth 2 (window-parameter side 'quit-restore)) new-source))
+              (quit-window nil side)
+              (should-not (window-live-p side))
+              (should (eq (selected-window) new-source))))
+        (kill-buffer source-buffer)
+        (kill-buffer displayed)))))
+
+(ert-deftest dwindle-tree-final-selection-cannot-rewrite-restoration-record ()
+  (dwindle-test--with-layout
+    (let* ((source (selected-window))
+           (buffer (generate-new-buffer " *dwindle-record-callback*"))
+           (target (dwindle-split buffer))
+           (before (dwindle-test--snapshot))
+           fired)
+      (unwind-protect
+          (let ((buffer-list-update-hook
+                 (list (lambda ()
+                         (when (and (not fired)
+                                    (eq (window-buffer (selected-window)) buffer)
+                                    (not (eq (selected-window) target)))
+                           (setq fired t)
+                           (set-window-parameter
+                            source 'quit-restore
+                            (list 'window 'window source (window-buffer source))))))))
+            (should-error (dwindle-rotate))
+            (should fired)
+            (should (equal before (dwindle-test--snapshot)))
+            (should-not (window-parameter source 'quit-restore)))
+        (kill-buffer buffer)))))
+
+(ert-deftest dwindle-tree-native-display-tab-remains-usable-and-quits ()
+  (require 'tab-bar)
+  (dwindle-test--with-layout
+    (let ((tabs (length (tab-bar-tabs)))
+          (editor-buffer (window-buffer (selected-window)))
+          (displayed (generate-new-buffer " *dwindle-native-tab*"))
+          (sibling-buffer (generate-new-buffer " *dwindle-tab-sibling*")))
+      (unwind-protect
+          (let* ((window (display-buffer-in-tab displayed nil))
+                 (record (window-parameter window 'quit-restore)))
+            (should (= (length (tab-bar-tabs)) (1+ tabs)))
+            (should (eq (car record) 'tab))
+            (should (dwindle--owned-window-p window))
+            (select-window window)
+            ;; File navigation can leave the original native tab record.
+            ;; It must not make an otherwise ordinary pane unusable.
+            (switch-to-buffer sibling-buffer)
+            (should (dwindle--owned-window-p window))
+            (switch-to-buffer displayed)
+            (dwindle-split sibling-buffer)
+            (dwindle-rotate)
+            (let ((target (get-buffer-window displayed)))
+              (should (dwindle--owned-window-p target))
+              (should (eq (nth 1 (window-parameter target 'quit-restore)) 'tab))
+              ;; Retain native tab-close semantics after BSP reconstruction.
+              (quit-window nil target)
+              (should (= (length (tab-bar-tabs)) tabs))
+              (should (eq (window-buffer (selected-window)) editor-buffer))))
+        (while (> (length (tab-bar-tabs)) tabs) (tab-bar-close-tab))
+        (kill-buffer displayed)
+        (kill-buffer sibling-buffer)))))
+
+(ert-deftest dwindle-tree-frame-restoration-records-remap-without-losing-type ()
+  ;; Batch Emacs cannot open a second terminal frame.  Exercise native
+  ;; frame bookkeeping on an ordinary pane; real frame quitting is checked
+  ;; separately by the disposable terminal review probe.
+  (dolist (method '(frame same))
+    (dwindle-test--with-layout
+      (let* ((source-buffer (generate-new-buffer " *dwindle-frame-source*"))
+             (displayed (generate-new-buffer " *dwindle-frame-display*"))
+             (source (dwindle-split source-buffer)))
+        (unwind-protect
+            (let ((target (split-window source nil 'below)))
+              (window--display-buffer displayed target 'frame)
+              (when (eq method 'same)
+                (window--display-buffer displayed target 'reuse))
+              (let ((record (window-parameter target 'quit-restore)))
+                (should (eq (car record) method))
+                (should (eq (nth 2 record) source))
+                (select-window target)
+                (dwindle-focus-parent)
+                (dwindle-rotate)
+                (let* ((new-target (get-buffer-window displayed))
+                       (new-source (get-buffer-window source-buffer))
+                       (new-record (window-parameter new-target 'quit-restore)))
+                  (should-not (window-live-p source))
+                  (should (eq (car new-record) method))
+                  (should (eq (nth 1 new-record) 'frame))
+                  (should (eq (nth 2 new-record) new-source))
+                  (should (eq (nth 2 record) source))
+                  (should (dwindle--owned-window-p new-target)))))
+          (kill-buffer displayed)
+          (kill-buffer source-buffer))))))
+
+(provide 'dwindle-ownership-tree-tests)
+;;; dwindle-ownership-tree-tests.el ends here

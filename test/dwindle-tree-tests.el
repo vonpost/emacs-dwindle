@@ -4,8 +4,8 @@
 
 (defun dwindle-tree-test--split (&optional window size side pixelwise)
   "Create an intentionally Dwindle-owned test pane with native geometry.
-Unlike plain `split-window', this models the ownership of an explicit
-user Dwindle split while allowing imported n-ary and custom-ratio fixtures."
+This also models explicit user ownership under the conservative policy,
+while allowing imported n-ary and custom-ratio fixtures."
   (let* ((window (or window (selected-window)))
          (new (split-window window size side pixelwise)))
     (dwindle--claim-window window)
@@ -26,6 +26,67 @@ user Dwindle split while allowing imported n-ary and custom-ratio fixtures."
                      (set-window-buffer window buffer)
                      (dwindle--claim-window window)
                      buffer)))
+
+(ert-deftest dwindle-tree-rotate-adopts-native-split-before-configuration-hook ()
+  (dwindle-test--with-layout
+    (let* ((left (selected-window))
+           (right (split-window left nil 'right))
+           (left-buffer (window-buffer left))
+           (buffer (generate-new-buffer " *dwindle-native-pane*")))
+      (unwind-protect
+          (progn
+            (set-window-buffer right buffer)
+            (select-window right)
+            ;; This is the first Dwindle query after native window creation.
+            (dwindle-rotate)
+            (should (window-combination-p (frame-root-window)))
+            (should (equal (dwindle-tree-test--buffers)
+                           (list left-buffer buffer)))
+            (should (eq (window-buffer (selected-window)) buffer))
+            (should (cl-every #'dwindle--owned-window-p
+                              (dwindle-test--windows))))
+        (kill-buffer buffer)))))
+
+(ert-deftest dwindle-tree-help-and-compilation-display-remain-usable ()
+  (require 'help-mode)
+  (require 'compile)
+  (dolist (kind '(help compilation))
+    (dwindle-test--with-layout
+      (let* ((editor (selected-window))
+             (editor-buffer (window-buffer editor))
+             (buffer (generate-new-buffer " *dwindle-special-display*"))
+             (display-buffer-overriding-action
+              '(display-buffer-pop-up-window))
+             (help-window-select nil))
+        (unwind-protect
+            (progn
+              (if (eq kind 'help)
+                  (with-help-window buffer
+                    (princ "A normal Help buffer should participate in the tree.\n"))
+                (with-current-buffer buffer
+                  (insert "Compilation finished.\n")
+                  (compilation-mode))
+                (display-buffer buffer))
+              (let ((displayed (get-buffer-window buffer)))
+                (should (window-live-p displayed))
+                (should-not (eq displayed editor))
+                (should (eq (selected-window) editor))
+                (with-current-buffer buffer
+                  (should (eq major-mode (if (eq kind 'help)
+                                             'help-mode 'compilation-mode)))
+                  (when (eq kind 'help)
+                    (should (derived-mode-p 'special-mode))))
+                (should (window-parameter displayed 'quit-restore))
+                (should (dwindle--owned-window-p displayed))
+                (select-window displayed)
+                (dwindle-rotate)
+                (should (window-combination-p (frame-root-window)))
+                (should (equal (dwindle-tree-test--buffers)
+                               (list editor-buffer buffer)))
+                (should (eq (window-buffer (selected-window)) buffer))
+                (should (cl-every #'dwindle--owned-window-p
+                                  (dwindle-test--windows)))))
+          (kill-buffer buffer))))))
 
 (ert-deftest dwindle-tree-rotate-toggles-parent-preserving-ratio-order-and-views ()
   (dwindle-test--with-layout
@@ -79,9 +140,10 @@ user Dwindle split while allowing imported n-ary and custom-ratio fixtures."
         (should (eq (dwindle-focus-parent) ordinary))
         (should (equal before (dwindle-test--snapshot)))))))
 
-(ert-deftest dwindle-tree-unmarked-package-window-is-protected-without-optout ()
+(ert-deftest dwindle-tree-explicit-policy-protects-unmarked-package-window ()
   (dwindle-test--with-layout
-    (let* ((owned (selected-window))
+    (let* ((dwindle-manage-windows 'explicit)
+           (owned (selected-window))
            ;; A package can create a plain window and retain its object
            ;; without installing ANY ownership or opt-out window parameter.
            (package-window (split-window owned nil 'right))
@@ -102,9 +164,10 @@ user Dwindle split while allowing imported n-ary and custom-ratio fixtures."
         (should-error (dwindle--tree-apply (frame-root-window) tree)
                       :type 'user-error)))))
 
-(ert-deftest dwindle-tree-owned-region-rotates-beside-unmarked-package-window ()
+(ert-deftest dwindle-tree-explicit-policy-rotates-beside-unmarked-package-window ()
   (dwindle-test--with-layout
-    (let* ((a (selected-window))
+    (let* ((dwindle-manage-windows 'explicit)
+           (a (selected-window))
            (foreign (split-window a -40 'right))
            (foreign-buffer (get-buffer-create " *opaque-package-pane*"))
            (b (dwindle-tree-test--split a nil 'below)))
@@ -120,9 +183,10 @@ user Dwindle split while allowing imported n-ary and custom-ratio fixtures."
         (should (dwindle--owned-window-p (window-prev-sibling (selected-window))))
         (should-not (dwindle--owned-window-p foreign))))))
 
-(ert-deftest dwindle-tree-display-buffer-pane-protects-its-native-reference ()
+(ert-deftest dwindle-tree-explicit-policy-protects-display-buffer-reference ()
   (dwindle-test--with-layout
-    (let* ((owned (selected-window))
+    (let* ((dwindle-manage-windows 'explicit)
+           (owned (selected-window))
            (buffer (get-buffer-create " *display-buffer-package*"))
            (foreign (display-buffer buffer '(display-buffer-pop-up-window))))
       (should (window-live-p foreign))
@@ -371,9 +435,10 @@ user Dwindle split while allowing imported n-ary and custom-ratio fixtures."
       (should fired)
       (should (equal before (dwindle-test--snapshot))))))
 
-(ert-deftest dwindle-tree-package-takeover-during-restoration-rolls-back ()
+(ert-deftest dwindle-tree-explicit-policy-special-mode-takeover-rolls-back ()
   (dwindle-test--with-layout
-    (let* ((a (selected-window))
+    (let* ((dwindle-manage-windows 'explicit)
+           (a (selected-window))
            (b (dwindle-tree-test--split a nil 'right))
            (buffer (generate-new-buffer " *package-takeover*"))
            (native-set-buffer (symbol-function 'set-window-buffer))

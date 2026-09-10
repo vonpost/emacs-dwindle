@@ -22,8 +22,10 @@
 (declare-function dwindle--claim-window "dwindle" (window))
 (declare-function dwindle--reconstruction-eligible-p "dwindle" (window))
 (declare-function dwindle--navigation-record-p "dwindle" (record window))
+(declare-function dwindle--restorable-record-p "dwindle" (record))
 (declare-function dwindle--subtree-windows "dwindle" (window))
 (declare-function dwindle--refresh "dwindle" (&optional frame))
+(declare-function dwindle--prepare-frame "dwindle" (&optional frame))
 (declare-function dwindle--next-side "dwindle" (window))
 (declare-function dwindle--call-with-window-transaction "dwindle"
                   (function &optional frame))
@@ -34,8 +36,8 @@
 
 (defun dwindle--tree-managed-p (window)
   "Whether WINDOW is a valid subtree owned wholly by Dwindle.
-Native panes created by another package remain outside reconstruction
-even when they carry no special window parameters."
+The current management policy and native application boundaries determine
+which leaves can participate in reconstruction."
   (and (window-valid-p window)
        (dwindle--resize-managed-subtree-p window)
        (cl-every #'dwindle--owned-window-p (dwindle--subtree-windows window))))
@@ -80,6 +82,7 @@ After the managed root, cycle back to the selected leaf.  Subsequent tree
 and resize commands operate on this node.  Changing selected windows or
 changing the remembered subtree's leaves invalidates this focus."
   (interactive)
+  (dwindle--prepare-frame)
   (unless (dwindle--owned-window-p (selected-window))
     (user-error "This window is outside the Dwindle-owned BSP region"))
   (let* ((node (dwindle--focused-node))
@@ -93,6 +96,35 @@ changing the remembered subtree's leaves invalidates this focus."
                (if (window-live-p next) "" "s")))
     next))
 
+(defun dwindle--tree-copy-quit-restore (record)
+  "Copy the native list structure of a recognized quit-restore RECORD.
+Leave unrelated, potentially cyclic application values untouched."
+  (if (dwindle--restorable-record-p record)
+      (list (nth 0 record)
+            (if (consp (nth 1 record))
+                (copy-sequence (nth 1 record))
+              (nth 1 record))
+            (nth 2 record) (nth 3 record))
+    record))
+
+(defun dwindle--tree-remap-quit-restore (record windows)
+  "Copy native RECORD, mapping its previous window through WINDOWS."
+  (if (dwindle--restorable-record-p record)
+      (let ((copy (dwindle--tree-copy-quit-restore record)))
+        (setcar (cddr copy) (gethash (nth 2 record) windows (nth 2 record)))
+        copy)
+    record))
+
+(defun dwindle--tree-view-quit-restore (view window windows)
+  "Return VIEW's native restoration record for WINDOW using WINDOWS."
+  (let ((record (dwindle--tree-remap-quit-restore
+                 (plist-get view :quit-restore) windows)))
+    ;; A freshly inserted leaf can inherit the source's navigation history.
+    ;; Its ordinary same-pane return target remains that new leaf itself.
+    (when (plist-get view :navigation)
+      (setcar (cddr record) window))
+    record))
+
 (defun dwindle--tree-capture-view (window)
   "Capture WINDOW's buffer, view, history, and presentation settings."
   (list :buffer (window-buffer window)
@@ -103,6 +135,8 @@ changing the remembered subtree's leaves invalidates this focus."
         :scroll-bars (window-scroll-bars window)
         :parameters (mapcar (lambda (pair) (cons (car pair) (cdr pair)))
                             (window-parameters window))
+        :quit-restore (dwindle--tree-copy-quit-restore
+                       (window-parameter window 'quit-restore))
         ;; Standard same-window navigation records contain a self-reference.
         ;; Snapshot only their known outer structure, never arbitrary values.
         :navigation (let ((record (window-parameter window 'quit-restore)))
@@ -205,35 +239,36 @@ minimum sizes can clamp the divider within the available rectangle."
       (dwindle--tree-plan second (if horizontal (- total size) width)
                           (if horizontal height (- total size))))))
 
-(defun dwindle--tree-check-destination (window expected-buffer)
+(defun dwindle--tree-check-destination (window expected-buffer &optional record)
   "Refuse WINDOW if an application claimed it or replaced EXPECTED-BUFFER.
+RECORD is the expected native quit-restore value, nil for temporary panes.
 This check must precede resetting parameters or assigning buffers, since
 either action could otherwise erase the evidence of a package takeover."
   (unless (and (window-live-p window)
                (eq (window-buffer window) expected-buffer)
+               (equal (window-parameter window 'quit-restore) record)
                (dwindle--reconstruction-eligible-p window))
     (error "An application claimed a pane during BSP reconstruction")))
 
-(defun dwindle--tree-restore-view (window view temporary)
-  "Restore captured VIEW into live WINDOW still displaying TEMPORARY."
+(defun dwindle--tree-restore-view (window view temporary windows)
+  "Restore VIEW into WINDOW displaying TEMPORARY, remapping through WINDOWS."
   (dwindle--tree-check-destination window temporary)
   ;; Restore old parameters before buffer initialization: application
   ;; scroll hooks can assign quit-restore, popup, or custom handlers, and
   ;; their newly installed ownership markers must never be overwritten.
   (dolist (parameter (window-parameters window))
     (set-window-parameter window (car parameter) nil))
-  (dolist (parameter (plist-get view :parameters))
-    (let ((navigation (and (eq (car parameter) 'quit-restore)
-                           (plist-get view :navigation))))
+  (let ((record (dwindle--tree-view-quit-restore view window windows)))
+    (dolist (parameter (plist-get view :parameters))
       (set-window-parameter
        window (car parameter)
-       (if navigation
-           (list (nth 0 navigation) (nth 1 navigation)
-                 window (nth 3 navigation))
-         (cdr parameter)))))
-  (set-window-buffer window (plist-get view :buffer))
-  (dwindle--tree-check-destination window (plist-get view :buffer))
-  (apply #'set-window-margins window (plist-get view :margins))
+       (if (eq (car parameter) 'quit-restore)
+           (dwindle--tree-copy-quit-restore record)
+         (cdr parameter))))
+    (set-window-buffer window (plist-get view :buffer))
+    (dwindle--tree-check-destination window (plist-get view :buffer) record))
+  (let ((margins (plist-get view :margins)))
+    (set-window-margins window (car margins) (cdr margins)))
   (apply #'set-window-fringes window (plist-get view :fringes))
   (let ((bars (plist-get view :scroll-bars)))
     (set-window-scroll-bars window (nth 0 bars) (nth 2 bars)
@@ -263,7 +298,7 @@ either action could otherwise erase the evidence of a package takeover."
       (dwindle--tree-build (dwindle--tree-second tree) second mapping temporary)
       parent)))
 
-(defun dwindle--tree-verify (tree mapping)
+(defun dwindle--tree-verify (tree mapping windows)
   "Verify that TREE's final native MAPPING still matches the preflight plan.
 Application callbacks may split or resize a window while its buffer is
 being restored.  Such intervening changes must abort the transaction."
@@ -275,6 +310,9 @@ being restored.  Such intervening changes must abort the transaction."
     (if (dwindle--tree-view tree)
         (unless (and (window-live-p window)
                      (dwindle--managed-window-p window)
+                     (equal (window-parameter window 'quit-restore)
+                            (dwindle--tree-view-quit-restore
+                             (dwindle--tree-view tree) window windows))
                      (eq (window-buffer window)
                          (plist-get (dwindle--tree-view tree) :buffer))
                      (= (window-point window)
@@ -294,8 +332,8 @@ being restored.  Such intervening changes must abort the transaction."
                    (eq (window-next-sibling (window-child window))
                        (gethash (dwindle--tree-second tree) mapping)))
         (error "An application callback changed the BSP tree"))
-      (dwindle--tree-verify (dwindle--tree-first tree) mapping)
-      (dwindle--tree-verify (dwindle--tree-second tree) mapping))))
+      (dwindle--tree-verify (dwindle--tree-first tree) mapping windows)
+      (dwindle--tree-verify (dwindle--tree-second tree) mapping windows))))
 
 (defun dwindle--tree-apply (region tree)
   "Transactionally replace managed REGION with TREE and return a node map.
@@ -311,6 +349,8 @@ On errors or quit, restore the exact pre-command window configuration."
          (original (dwindle--subtree-windows region))
          (anchor (car original))
          (anchor-buffer (window-buffer anchor))
+         (anchor-record (dwindle--tree-copy-quit-restore
+                         (window-parameter anchor 'quit-restore)))
          (selected (selected-window))
          (selected-node (dwindle--tree-find tree selected))
          (edges (window-edges region nil nil t))
@@ -318,17 +358,31 @@ On errors or quit, restore the exact pre-command window configuration."
                             (list window (window-edges window nil nil t)
                                   (window-buffer window) (window-point window)
                                   (window-start window) (window-hscroll window)
-                                  (window-vscroll window t)))
+                                  (window-vscroll window t)
+                                  (dwindle--tree-copy-quit-restore
+                                   (window-parameter window 'quit-restore))))
                           (cl-set-difference (window-list frame 'nomini
                                                          (frame-first-window frame))
                                              original)))
+         (remote-records
+          (cl-loop for other-frame in (frame-list)
+                   unless (eq other-frame frame)
+                   append
+                   (cl-loop for window in (window-list other-frame 'nomini)
+                            for record = (window-parameter window 'quit-restore)
+                            when (and (dwindle--restorable-record-p record)
+                                      (memq (nth 2 record) original))
+                            collect (list window record
+                                          (dwindle--tree-copy-quit-restore record)))))
          (focus (frame-parameter frame 'dwindle-focus))
          (mapping (make-hash-table :test #'eq))
+         (windows (make-hash-table :test #'eq))
          (dwindle--inhibit t)
          (temporary (let ((buffer-list-update-hook nil))
                       (generate-new-buffer " *dwindle-tree*")))
          (window-combination-limit t)
          (window-combination-resize nil)
+         remote-changes
          complete)
     (unwind-protect
         (dwindle--call-with-window-transaction
@@ -339,17 +393,20 @@ On errors or quit, restore the exact pre-command window configuration."
           (dolist (window (cdr original)) (delete-window window))
           (unless (equal (window-edges anchor nil nil t) edges)
             (error "Collapsing the subtree changed its outer boundary"))
-          (dwindle--tree-check-destination anchor anchor-buffer)
+          (dwindle--tree-check-destination anchor anchor-buffer anchor-record)
           (dolist (parameter (window-parameters anchor))
             (set-window-parameter anchor (car parameter) nil))
           (set-window-buffer anchor temporary)
           (dwindle--tree-check-destination anchor temporary)
           (dwindle--tree-build tree anchor mapping temporary)
           (dolist (leaf (dwindle--tree-leaves tree))
+            (when (dwindle--tree-window leaf)
+              (puthash (dwindle--tree-window leaf) (gethash leaf mapping) windows)))
+          (dolist (leaf (dwindle--tree-leaves tree))
             (dwindle--tree-restore-view (gethash leaf mapping)
-                                       (dwindle--tree-view leaf) temporary))
+                                       (dwindle--tree-view leaf) temporary windows))
           (when selected-node (select-window (gethash selected-node mapping)))
-          (dwindle--tree-verify tree mapping)
+          (dwindle--tree-verify tree mapping windows)
           (unless (equal (window-edges (gethash tree mapping) nil nil t) edges)
             (error "An application callback moved the BSP region"))
           (unless (= (length (window-list frame 'nomini))
@@ -363,11 +420,31 @@ On errors or quit, restore the exact pre-command window configuration."
                                         (window-buffer window) (window-point window)
                                         (window-start window)
                                         (window-hscroll window)
-                                        (window-vscroll window t))))
+                                        (window-vscroll window t)
+                                        (window-parameter window 'quit-restore))))
                 (error "The BSP transformation affected an outside window"))))
-          ;; Only an already owned region can reach this point.  Transfer
-          ;; ownership to its verified replacement leaves; unrelated native
-          ;; splits never enter this registry through layout observation.
+          ;; A protected pane may return focus to a pane being reconstructed.
+          ;; Repair that native reference without changing its other state.
+          (dolist (snapshot outside)
+            (let* ((window (car snapshot))
+                   (record (nth 7 snapshot))
+                   (remapped (dwindle--tree-remap-quit-restore record windows)))
+              (unless (equal record remapped)
+                (set-window-parameter window 'quit-restore remapped))))
+          ;; Native popup frames can return focus across frame boundaries.
+          ;; Only their restoration parameter needs repair; remote layouts
+          ;; do not belong to this frame's reconstruction transaction.
+          (dolist (snapshot remote-records)
+            (let* ((window (car snapshot))
+                   (record (nth 2 snapshot))
+                   (remapped (dwindle--tree-remap-quit-restore record windows)))
+              (when (and (window-live-p window) (not (equal record remapped)))
+                (unless (equal (window-parameter window 'quit-restore) record)
+                  (error "An application changed a remote restoration record"))
+                (push snapshot remote-changes)
+                (set-window-parameter window 'quit-restore remapped))))
+          ;; Transfer the region's ownership to verified replacement leaves.
+          ;; Recheck eligibility after application initialization callbacks.
           (dolist (leaf (dwindle--tree-leaves tree))
             (unless (dwindle--claim-window (gethash leaf mapping))
               (error "An application claimed a pane during BSP reconstruction")))
@@ -377,6 +454,9 @@ On errors or quit, restore the exact pre-command window configuration."
           mapping)
          frame)
       (unless complete
+        (dolist (snapshot remote-changes)
+          (when (window-live-p (car snapshot))
+            (set-window-parameter (car snapshot) 'quit-restore (nth 1 snapshot))))
         (set-frame-parameter frame 'dwindle-focus focus))
       (when (buffer-live-p temporary)
         (with-current-buffer temporary
@@ -389,6 +469,7 @@ On errors or quit, restore the exact pre-command window configuration."
 OPERATION receives a model tree and returns its replacement."
   (when dwindle--inhibit
     (user-error "A Dwindle window operation is already in progress"))
+  (dwindle--prepare-frame)
   (unless (dwindle--owned-window-p (selected-window))
     (user-error "This window is outside the Dwindle-owned BSP region"))
   (let* ((focused (dwindle--focused-node))
@@ -542,6 +623,7 @@ BSP insertion at an internal node.  Return the new leaf; preserve selection."
 The mark survives focus changes and is discarded when its native subtree
 changes.  Use `dwindle-focus-parent' first to mark a whole subtree."
   (interactive)
+  (dwindle--prepare-frame)
   (unless (dwindle--owned-window-p (selected-window))
     (user-error "This window is outside the Dwindle-owned BSP region"))
   (let* ((node (dwindle--focused-node))
@@ -604,6 +686,7 @@ Place SOURCE first, or second if AFTER.  SOURCE and TARGET must be disjoint."
 The source and target must be disjoint and belong to one wholly managed
 region.  Preserve leaf views and the currently focused buffer."
   (interactive)
+  (dwindle--prepare-frame)
   (unless (dwindle--owned-window-p (selected-window))
     (user-error "This window is outside the Dwindle-owned BSP region"))
   (let* ((source (dwindle--selected-node))
@@ -622,6 +705,7 @@ region.  Preserve leaf views and the currently focused buffer."
 
 (defun dwindle--split-shift (previous)
   "Move the focused leaf's split towards PREVIOUS or the following leaf."
+  (dwindle--prepare-frame)
   (unless (dwindle--owned-window-p (selected-window))
     (user-error "This window is outside the Dwindle-owned BSP region"))
   (let* ((source (dwindle--focused-node))
